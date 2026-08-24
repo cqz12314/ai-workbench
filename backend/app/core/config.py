@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
     workspace_enabled: bool = False
     workspace_root: str | None = None
+    code_index_enabled: bool = False
     git_enabled: bool = False
     litellm_model: str | None = None
     deepseek_api_key: SecretStr | None = None

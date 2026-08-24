@@ -17,6 +17,8 @@ def test_registry_exposes_only_expected_read_only_tools() -> None:
     assert set(tools.TOOL_REGISTRY) == {
         "search_knowledge",
         "list_documents",
+        "index_codebase",
+        "search_codebase",
         "github_list_repositories",
         "github_get_file",
         "github_search_code",
@@ -67,6 +69,27 @@ def test_search_tool_validates_and_executes(monkeypatch) -> None:
     assert calls == [("Agent", 3)]
     assert result["results"][0]["filename"] == "guide.md"
     assert result["results"][0]["content"] == "Agent knowledge"
+
+
+def test_index_codebase_rejects_paths_and_search_is_strict(monkeypatch) -> None:
+    monkeypatch.setattr(tools, "index_codebase", lambda: {"indexed": 0})
+
+    result = asyncio.run(tools.execute_tool("index_codebase", {}))
+
+    assert result == {"indexed": 0}
+    with pytest.raises(ToolArgumentsError):
+        asyncio.run(tools.execute_tool("index_codebase", {"path": "/tmp"}))
+    with pytest.raises(ToolArgumentsError):
+        asyncio.run(tools.execute_tool("search_codebase", {"query": "login", "limit": "5"}))
+
+
+def test_disabled_code_index_tool_is_rejected(monkeypatch) -> None:
+    from app.services import code_index
+
+    monkeypatch.setattr(code_index.settings, "code_index_enabled", False)
+
+    with pytest.raises(tools.ToolExecutionError, match="disabled"):
+        asyncio.run(tools.execute_tool("index_codebase", {}))
 
 
 def test_list_documents_never_returns_file_path(monkeypatch) -> None:

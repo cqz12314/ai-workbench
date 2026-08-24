@@ -25,6 +25,20 @@ SYSTEM_PATH_PREFIXES = (
     "/usr",
     "/var",
 )
+SENSITIVE_DIRECTORY_NAMES = {".ssh", ".git", ".env", "certificates"}
+CREDENTIAL_SUFFIXES = {".key", ".pem", ".p12", ".crt", ".cer"}
+CREDENTIAL_FILENAMES = {
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "credentials.json",
+    "private_key",
+    "private-key",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+}
 
 
 class WorkspaceError(RuntimeError):
@@ -68,6 +82,10 @@ def _workspace_root() -> Path:
     root = Path(settings.workspace_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise WorkspacePathError("Workspace root is unavailable")
+    if root == Path(root.anchor) or any(
+        str(root) == prefix or str(root).startswith(f"{prefix}/") for prefix in SYSTEM_PATH_PREFIXES
+    ):
+        raise WorkspacePathError("System paths cannot be used as a workspace")
     return root
 
 
@@ -76,11 +94,46 @@ def workspace_root() -> Path:
     return _workspace_root()
 
 
+def is_sensitive_relative_path(relative_path: str | Path) -> bool:
+    """Return whether a workspace-relative path is unsafe to expose or index."""
+    path = Path(relative_path)
+    lowered_parts = tuple(part.casefold() for part in path.parts)
+    if any(part in SENSITIVE_DIRECTORY_NAMES or part.startswith(".env.") for part in lowered_parts):
+        return True
+    name = path.name.casefold()
+    if name == ".env" or name.startswith(".env."):
+        return True
+    if name in CREDENTIAL_FILENAMES or path.suffix.casefold() in CREDENTIAL_SUFFIXES:
+        return True
+    stem = path.stem.casefold().replace("-", "_")
+    return stem in {
+        "credential",
+        "credentials",
+        "private_key",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+    }
+
+
+def _contains_symlink(root: Path, supplied_path: Path) -> bool:
+    current = root
+    for part in supplied_path.parts:
+        if part in {"", "."}:
+            continue
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
 def resolve_path(file_path: str) -> Path:
     if not isinstance(file_path, str) or not file_path.strip():
         raise WorkspacePathError("File path must not be blank")
     root = _workspace_root()
-    candidate = (root / file_path.strip()).resolve()
+    supplied = Path(file_path.strip())
+    candidate = (root / supplied).resolve()
     if any(
         str(candidate) == prefix or str(candidate).startswith(f"{prefix}/")
         for prefix in SYSTEM_PATH_PREFIXES
@@ -90,21 +143,20 @@ def resolve_path(file_path: str) -> Path:
         candidate.relative_to(root)
     except ValueError as exc:
         raise WorkspacePathError("File path is outside the workspace") from exc
-    parts = candidate.relative_to(root).parts
-    if any(
-        part in {".ssh", ".git", ".env"} or part.startswith(".env.") for part in parts
-    ):
+    relative = candidate.relative_to(root)
+    if is_sensitive_relative_path(relative):
         raise WorkspacePathError("Sensitive files are not allowed")
-    if candidate.name in {"id_rsa", "id_ed25519"} or candidate.suffix.lower() in {
-        ".key",
-        ".pem",
-        ".p12",
-        ".crt",
-    }:
-        raise WorkspacePathError("Credential files are not allowed")
-    if candidate.exists() and candidate.is_symlink():
+    if _contains_symlink(root, supplied):
         raise WorkspacePathError("Symlink paths are not allowed")
     return candidate
+
+
+def resolve_indexable_file(relative_path: str | Path) -> Path:
+    """Resolve a regular, non-symlink file using the shared workspace policy."""
+    path = resolve_path(Path(relative_path).as_posix())
+    if not path.exists() or not path.is_file():
+        raise WorkspaceFileError("Workspace file does not exist")
+    return path
 
 
 def _hash_content(content: str) -> str:

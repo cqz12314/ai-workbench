@@ -19,6 +19,15 @@ class VectorStoreError(RuntimeError):
     """Raised when vector persistence or retrieval fails."""
 
 
+@lru_cache
+def get_chroma_client() -> ClientAPI:
+    CHROMA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(
+        path=str(CHROMA_DIRECTORY),
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
 @dataclass(frozen=True)
 class VectorChunk:
     id: int
@@ -123,9 +132,4 @@ class VectorStore:
 
 @lru_cache
 def get_vector_store() -> VectorStore:
-    CHROMA_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIRECTORY),
-        settings=Settings(anonymized_telemetry=False),
-    )
-    return VectorStore(client)
+    return VectorStore(get_chroma_client())
