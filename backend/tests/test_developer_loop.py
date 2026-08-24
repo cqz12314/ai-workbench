@@ -129,3 +129,30 @@ def test_agent_cannot_run_unknown_task(monkeypatch, development_db):
     )
     with pytest.raises(ToolExecutionError):
         asyncio.run(agent.create_agent_completion([{"role": "user", "content": "执行任务"}]))
+
+
+def test_developer_loop_registry_remains_available_but_not_to_auto_agent(
+    development_db, monkeypatch
+) -> None:
+    from app.services import agent, tools
+
+    assert {"task_plan", "run_task"} <= set(tools.TOOL_REGISTRY)
+    automatic_names = {
+        schema["function"]["name"] for schema in agent.get_auto_llm_tools()
+    }
+    assert "task_plan" not in automatic_names
+    assert "run_task" not in automatic_names
+    assert "separate controlled entrypoint" in agent.AGENT_SYSTEM_PROMPT
+
+    plan = asyncio.run(
+        tools.execute_tool("task_plan", {"task": "运行已有项目测试"})
+    )
+    monkeypatch.setattr(
+        task_executor,
+        "run_test",
+        lambda _name: {"passed": True, "returncode": 0, "test": "pytest"},
+    )
+    result = asyncio.run(
+        tools.execute_tool("run_task", {"task_id": plan["task_id"], "test_name": "pytest"})
+    )
+    assert result["status"] == "completed"

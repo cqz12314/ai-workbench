@@ -10,6 +10,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.session import SessionLocal
 from app.models import Document
+from app.services.code_index import (
+    CodeIndexError,
+    index_codebase,
+    search_codebase,
+)
 from app.services.git import (
     GitError,
     git_commit,
@@ -75,6 +80,25 @@ class SearchKnowledgeArguments(BaseModel):
 
 class ListDocumentsArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class IndexCodebaseArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class SearchCodebaseArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    query: str = Field(min_length=1, max_length=1000)
+    limit: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("query")
+    @classmethod
+    def normalize_query(cls, value: str) -> str:
+        query = value.strip()
+        if not query:
+            raise ValueError("query must not be blank")
+        return query
 
 
 class GitHubPaginationArguments(BaseModel):
@@ -209,6 +233,8 @@ class RunTaskArguments(BaseModel):
 ToolArguments = (
     SearchKnowledgeArguments
     | ListDocumentsArguments
+    | IndexCodebaseArguments
+    | SearchCodebaseArguments
     | GitHubRepositoryArguments
     | GitHubFileArguments
     | GitHubCodeSearchArguments
@@ -292,6 +318,39 @@ def execute_list_documents(arguments: ToolArguments) -> dict[str, Any]:
                 "created_at": document.created_at.isoformat(),
             }
             for document in documents
+        ]
+    }
+
+
+def execute_index_codebase(arguments: ToolArguments) -> dict[str, Any]:
+    if not isinstance(arguments, IndexCodebaseArguments):
+        raise ToolArgumentsError("Invalid arguments for index_codebase")
+    try:
+        return index_codebase()
+    except CodeIndexError as exc:
+        raise ToolExecutionError(str(exc)) from exc
+
+
+def execute_search_codebase(arguments: ToolArguments) -> dict[str, Any]:
+    if not isinstance(arguments, SearchCodebaseArguments):
+        raise ToolArgumentsError("Invalid arguments for search_codebase")
+    try:
+        results = search_codebase(arguments.query, arguments.limit)
+    except CodeIndexError as exc:
+        raise ToolExecutionError(str(exc)) from exc
+    return {
+        "results": [
+            {
+                "relative_path": result.relative_path,
+                "language": result.language,
+                "symbol_name": result.symbol_name,
+                "symbol_type": result.symbol_type,
+                "start_line": result.start_line,
+                "end_line": result.end_line,
+                "content": result.content,
+                "distance": result.distance,
+            }
+            for result in results
         ]
     }
 
@@ -501,6 +560,21 @@ TOOL_REGISTRY = {
         description="List uploaded documents without exposing server filesystem paths.",
         arguments_model=ListDocumentsArguments,
         executor=execute_list_documents,
+    ),
+    "index_codebase": ToolDefinition(
+        name="index_codebase",
+        description=(
+            "Index supported source files in the configured workspace only. "
+            "It accepts no path and never modifies source files."
+        ),
+        arguments_model=IndexCodebaseArguments,
+        executor=execute_index_codebase,
+    ),
+    "search_codebase": ToolDefinition(
+        name="search_codebase",
+        description="Search bounded relevant code chunks in the configured workspace.",
+        arguments_model=SearchCodebaseArguments,
+        executor=execute_search_codebase,
     ),
     "github_list_repositories": ToolDefinition(
         name="github_list_repositories",
