@@ -16,6 +16,7 @@ class FakeCodeStore:
         self.replaced: list[str] = []
         self.deleted: list[str] = []
         self.search_results: list[CodeSearchResult] = []
+        self.candidate_calls: list[dict] = []
 
     def indexed_files(self, _workspace_id: str) -> dict[str, str]:
         return dict(self.files)
@@ -34,6 +35,10 @@ class FakeCodeStore:
         self.files.pop(relative_path, None)
 
     def search(self, _workspace_id: str, _query: str, _limit: int):
+        return self.search_results
+
+    def _hybrid_candidates(self, workspace_id: str, query: str, **kwargs):
+        self.candidate_calls.append({"workspace_id": workspace_id, "query": query, **kwargs})
         return self.search_results
 
 
@@ -219,9 +224,7 @@ const concise = (value: number) => value * 2;
     chunks = code_index.chunk_javascript(source, "demo", "Header.tsx", "tsx", "hash")
 
     assert chunk_by(chunks, "Header")
-    residual = "\n".join(
-        chunk.content for chunk in chunks if chunk.symbol_type == "text_block"
-    )
+    residual = "\n".join(chunk.content for chunk in chunks if chunk.symbol_type == "text_block")
     assert "interface Props" in residual
     assert "const concise" in residual
     assert "return <h1>Title</h1>;" not in residual
@@ -463,5 +466,307 @@ def test_search_applies_result_and_total_content_limits(enabled_workspace) -> No
     assert len(results) == 4
     assert all(len(result.content) <= code_index.MAX_RESULT_CHARS for result in results)
     assert sum(len(result.content) for result in results) <= code_index.MAX_SEARCH_TOTAL_CHARS
+    assert store.candidate_calls[0]["semantic_limit"] == 100
     with pytest.raises(code_index.CodeIndexError):
         code_index.search_codebase("login", limit=11, store=store)
+
+
+def search_result(
+    path: str,
+    symbol: str,
+    content: str,
+    distance: float,
+    symbol_type: str = "function",
+    start_line: int = 1,
+) -> CodeSearchResult:
+    return CodeSearchResult(
+        path,
+        "python",
+        symbol,
+        symbol_type,
+        start_line,
+        start_line + 2,
+        content,
+        distance,
+    )
+
+
+def test_exact_symbol_definition_outranks_better_vector_matches() -> None:
+    results = [
+        search_result(
+            "backend/tests/test_code_index.py",
+            "test_incremental_index_codebase",
+            "index_codebase index_codebase",
+            0.05,
+        ),
+        search_result(
+            "backend/app/services/tools.py",
+            "execute_index_codebase",
+            "return index_codebase()",
+            0.08,
+        ),
+        search_result(
+            "backend/app/services/code_index.py",
+            "index_codebase",
+            "def index_codebase(): pass",
+            0.45,
+        ),
+    ]
+
+    ranked = code_index._rerank_code_results("index_codebase", results)
+
+    assert ranked[0].symbol_name == "index_codebase"
+    assert ranked[0].relative_path == "backend/app/services/code_index.py"
+
+
+def test_symbol_prefix_and_token_boundaries_are_conservative() -> None:
+    results = [
+        search_result("agent.py", "get_auto_llm_tools", "implementation", 0.4),
+        search_result("chemistry.py", "reagent_factory", "implementation", 0.05),
+    ]
+
+    ranked = code_index._rerank_code_results("get_auto", results)
+
+    assert ranked[0].symbol_name == "get_auto_llm_tools"
+    assert code_index._token_coverage(("agent",), "reagent_factory") == 0
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_path"),
+    [
+        ("code_index.py", "backend/app/services/code_index.py"),
+        ("agent.py", "backend/app/services/agent.py"),
+        ("services/agent", "backend/app/services/agent.py"),
+        ("backend/app/services/agent.py", "backend/app/services/agent.py"),
+        ("test_code_index.py", "backend/tests/test_code_index.py"),
+    ],
+)
+def test_filename_and_path_queries_prioritize_exact_targets(query: str, expected_path: str) -> None:
+    results = [
+        search_result("backend/app/services/code_index.py", "first", "code", 0.4),
+        search_result("backend/tests/test_code_index.py", "test_first", "test", 0.1),
+        search_result("backend/app/services/agent.py", "agent_one", "agent", 0.45),
+        search_result("backend/app/services/agent.py", "agent_two", "agent", 0.46, start_line=20),
+        search_result("backend/tests/test_agent.py", "test_agent", "agent", 0.08),
+    ]
+
+    ranked = code_index._rerank_code_results(query, results)
+
+    assert ranked[0].relative_path == expected_path
+
+
+def test_production_filename_dominates_top_results_without_global_test_penalty() -> None:
+    results = [
+        search_result(
+            "backend/app/services/code_index.py",
+            f"production_{index}",
+            "implementation",
+            0.4 + index / 100,
+            start_line=index * 10 + 1,
+        )
+        for index in range(4)
+    ]
+    results.extend(
+        [
+            search_result(
+                "backend/tests/test_code_index.py",
+                "test_code_index_behavior",
+                "code_index.py tests",
+                0.01,
+            ),
+            search_result(
+                "backend/tests/test_code_index.py",
+                "test_exact_hybrid_result",
+                "test implementation",
+                0.02,
+                start_line=50,
+            ),
+        ]
+    )
+
+    production_ranked = code_index._rerank_code_results("code_index.py", results)
+    test_ranked = code_index._rerank_code_results("test_code_index.py", results)
+
+    assert all(
+        result.relative_path == "backend/app/services/code_index.py"
+        for result in production_ranked[:4]
+    )
+    assert test_ranked[0].relative_path == "backend/tests/test_code_index.py"
+
+
+def test_exact_test_symbol_can_rank_first() -> None:
+    test_definition = search_result(
+        "backend/tests/test_code_index.py",
+        "test_candidate_order_is_deterministic_across_scandir_orders",
+        "def test_candidate_order_is_deterministic_across_scandir_orders(): pass",
+        0.5,
+    )
+    implementation = search_result(
+        "backend/app/services/code_index.py",
+        "_candidate_paths",
+        "candidate order deterministic scandir",
+        0.02,
+    )
+
+    ranked = code_index._rerank_code_results(
+        test_definition.symbol_name, [implementation, test_definition]
+    )
+
+    assert ranked[0] == test_definition
+
+
+@pytest.mark.parametrize(
+    ("query", "implementation_symbol"),
+    [
+        ("automatic agent tool allowlist write tools", "get_auto_llm_tools"),
+        ("stale index cleanup", "index_codebase"),
+        ("incremental indexing", "index_codebase"),
+    ],
+)
+def test_concept_queries_prefer_relevant_implementation_without_hiding_tests(
+    query: str, implementation_symbol: str
+) -> None:
+    implementation = search_result(
+        "backend/app/services/agent.py"
+        if implementation_symbol == "get_auto_llm_tools"
+        else "backend/app/services/code_index.py",
+        implementation_symbol,
+        f"implementation for {query}",
+        0.3,
+    )
+    matching_test = search_result(
+        "backend/tests/test_agent.py",
+        "test_" + "_".join(code_index._lexical_tokens(query)),
+        query,
+        0.1,
+    )
+    semantic_decoy = search_result(
+        "backend/tests/test_integration.py",
+        "test_related_workflow",
+        f"verify {query} behavior",
+        0.05,
+    )
+    lexical_decoy = search_result(
+        "backend/app/services/maintenance.py",
+        "refresh_repository_cache",
+        "related repository maintenance and persistence workflow",
+        0.45,
+    )
+    caller_decoy = search_result(
+        "backend/app/controllers/task_controller.py",
+        "dispatch_maintenance_task",
+        f"caller for {query.split()[0]} workflow",
+        0.55,
+    )
+    documentation_decoy = search_result(
+        "backend/docs/developer_workflow.md",
+        "developer_workflow",
+        f"operational notes about {query.split()[-1]}",
+        0.65,
+        symbol_type="text_block",
+    )
+
+    candidates = [
+        matching_test,
+        semantic_decoy,
+        lexical_decoy,
+        caller_decoy,
+        documentation_decoy,
+        implementation,
+    ]
+    ranked = code_index._rerank_code_results(query, candidates)
+
+    assert len(ranked) == 6
+    assert implementation in ranked[:3]
+
+
+def test_allowlist_query_keeps_agent_implementation_in_top_three() -> None:
+    query = "automatic agent tool allowlist write tools"
+    implementation = search_result(
+        "backend/app/services/agent.py",
+        "get_auto_llm_tools",
+        "return tools allowed for the automatic agent",
+        0.3,
+    )
+    tests = [
+        search_result(
+            "backend/tests/test_agent.py",
+            f"test_agent_write_boundary_{index}",
+            "automatic agent tool allowlist write tools",
+            0.1 + index / 100,
+            start_line=index * 10 + 1,
+        )
+        for index in range(4)
+    ]
+
+    ranked = code_index._rerank_code_results(query, [*tests, implementation])
+
+    assert implementation in ranked[:3]
+
+
+def test_natural_language_without_strong_lexical_signal_preserves_vector_order() -> None:
+    semantic = search_result("a.py", "unrelated", "session validation", 0.1)
+    weaker = search_result("b.py", "other", "account checks", 0.3)
+
+    ranked = code_index._rerank_code_results("where is login handled", [weaker, semantic])
+
+    assert ranked[0] == semantic
+
+
+def test_generic_query_allows_semantically_better_test_to_outrank_production() -> None:
+    test_result = search_result(
+        "backend/tests/test_beta.py",
+        "check_beta",
+        "opaque beta routine",
+        0.05,
+    )
+    production_result = search_result(
+        "backend/app/services/alpha_impl.py",
+        "perform_alpha",
+        "opaque alpha routine",
+        0.5,
+    )
+
+    ranked = code_index._rerank_code_results(
+        "where is behavior coordinated", [production_result, test_result]
+    )
+
+    assert ranked[0] == test_result
+
+
+def test_hybrid_ranking_is_deterministic_for_equal_candidates() -> None:
+    first = search_result("b.py", "same", "same", 0.2)
+    second = search_result("a.py", "same", "same", 0.2)
+
+    forward = code_index._rerank_code_results("same", [first, second])
+    reversed_input = code_index._rerank_code_results("same", [second, first])
+
+    assert forward == reversed_input
+    assert [result.relative_path for result in forward] == ["a.py", "b.py"]
+
+
+def test_path_catalog_guarantees_filename_and_suffix_matches() -> None:
+    paths = [
+        "backend/tests/test_agent.py",
+        "frontend/src/agent.ts",
+        "backend/app/services/agent.py",
+        "backend/app/services/code_index.py",
+    ]
+
+    assert code_index._matching_indexed_paths("agent.py", paths) == [
+        "backend/app/services/agent.py"
+    ]
+    assert code_index._matching_indexed_paths("services/agent", paths) == [
+        "backend/app/services/agent.py"
+    ]
+    assert code_index._matching_indexed_paths("backend/app/services/agent.py", paths) == [
+        "backend/app/services/agent.py"
+    ]
+
+
+def test_path_catalog_accepts_query_prefix_outside_workspace_root() -> None:
+    paths = ["app/services/agent.py", "tests/test_agent.py"]
+
+    assert code_index._matching_indexed_paths("backend/app/services/agent.py", paths) == [
+        "app/services/agent.py"
+    ]
