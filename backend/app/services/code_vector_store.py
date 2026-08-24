@@ -10,6 +10,10 @@ from app.services.embeddings import EmbeddingService
 from app.services.vector_store import VectorStoreError, get_chroma_client
 
 CODE_COLLECTION_NAME = "code_chunks"
+MAX_PUBLIC_CODE_RESULTS = 10
+MAX_HYBRID_VECTOR_CANDIDATES = 100
+MAX_EXACT_SYMBOL_CANDIDATES = 20
+MAX_TARGETED_PATH_CANDIDATES = 40
 logger = logging.getLogger(__name__)
 
 
@@ -145,18 +149,89 @@ class CodeVectorStore:
         return self.upsert_chunks(chunks, embeddings)
 
     def search(self, workspace_id: str, query: str, limit: int) -> list[CodeSearchResult]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_PUBLIC_CODE_RESULTS
+        ):
+            raise VectorStoreError("Code search limit must be between 1 and 10")
         try:
-            count = self.collection.count()
-            if count == 0:
-                return []
-            response: dict[str, Any] = self.collection.query(
-                query_embeddings=[self.embedding_service.embed(query)],
-                n_results=min(limit, count),
-                where={"workspace_id": workspace_id},
-                include=["documents", "metadatas", "distances"],
-            )
+            embedding = self.embedding_service.embed(query)
+            return self._query_candidates(workspace_id, embedding, limit)
         except Exception as exc:
+            if isinstance(exc, VectorStoreError):
+                raise
             raise VectorStoreError("Code search failed") from exc
+
+    def _hybrid_candidates(
+        self,
+        workspace_id: str,
+        query: str,
+        *,
+        semantic_limit: int,
+        exact_symbol: str | None = None,
+        relative_paths: list[str] | None = None,
+    ) -> list[CodeSearchResult]:
+        """Retrieve bounded hybrid candidates without changing the public search contract."""
+        if not 1 <= semantic_limit <= MAX_HYBRID_VECTOR_CANDIDATES:
+            raise VectorStoreError("Hybrid candidate limit is invalid")
+        paths = list(dict.fromkeys(relative_paths or []))[:MAX_TARGETED_PATH_CANDIDATES]
+        try:
+            embedding = self.embedding_service.embed(query)
+            candidates = self._query_candidates(workspace_id, embedding, semantic_limit)
+            if exact_symbol:
+                candidates.extend(
+                    self._query_candidates(
+                        workspace_id,
+                        embedding,
+                        MAX_EXACT_SYMBOL_CANDIDATES,
+                        metadata_filter={"symbol_name": {"$eq": exact_symbol}},
+                    )
+                )
+            remaining_path_candidates = MAX_TARGETED_PATH_CANDIDATES
+            for index, relative_path in enumerate(paths):
+                paths_left = len(paths) - index
+                path_limit = max(1, remaining_path_candidates // paths_left)
+                path_results = self._query_candidates(
+                    workspace_id,
+                    embedding,
+                    path_limit,
+                    metadata_filter={"relative_path": {"$eq": relative_path}},
+                )
+                candidates.extend(path_results)
+                remaining_path_candidates -= len(path_results)
+                if remaining_path_candidates <= 0:
+                    break
+            return candidates
+        except Exception as exc:
+            if isinstance(exc, VectorStoreError):
+                raise
+            raise VectorStoreError("Hybrid code candidate retrieval failed") from exc
+
+    def _query_candidates(
+        self,
+        workspace_id: str,
+        embedding: list[float],
+        limit: int,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[CodeSearchResult]:
+        count = self.collection.count()
+        if count == 0 or limit <= 0:
+            return []
+        filters: list[dict[str, Any]] = [{"workspace_id": {"$eq": workspace_id}}]
+        if metadata_filter:
+            filters.append(metadata_filter)
+        where: dict[str, Any] = filters[0] if len(filters) == 1 else {"$and": filters}
+        response: dict[str, Any] = self.collection.query(
+            query_embeddings=[embedding],
+            n_results=min(limit, count),
+            where=where,
+            include=["documents", "metadatas", "distances"],
+        )
+        return self._search_results(response)
+
+    @staticmethod
+    def _search_results(response: dict[str, Any]) -> list[CodeSearchResult]:
         documents = response.get("documents") or [[]]
         metadatas = response.get("metadatas") or [[]]
         distances = response.get("distances") or [[]]

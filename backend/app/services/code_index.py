@@ -29,6 +29,17 @@ DEFAULT_SEARCH_LIMIT = 5
 MAX_SEARCH_LIMIT = 10
 MAX_RESULT_CHARS = 4_000
 MAX_SEARCH_TOTAL_CHARS = 16_000
+HYBRID_VECTOR_CANDIDATES = 100
+MAX_HYBRID_PATH_MATCHES = 20
+IDENTIFIER_QUERY = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$")
+LEXICAL_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+DEFINITION_SYMBOL_TYPES = {
+    "class",
+    "function",
+    "async_function",
+    "method",
+    "async_method",
+}
 
 SUPPORTED_EXTENSIONS = {
     ".py": "python",
@@ -174,6 +185,7 @@ def chunk_python(source: str, project: str, relative_path: str, file_hash: str) 
         language="python",
         file_hash=file_hash,
     )
+
     def visit(nodes: list[ast.stmt], parents: list[tuple[str, str]]) -> None:
         for node in nodes:
             if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -642,6 +654,142 @@ def _vector_chunks(workspace_id: str, chunks: list[CodeChunk]) -> list[CodeVecto
     return [CodeVectorChunk(workspace_id=workspace_id, **chunk.__dict__) for chunk in chunks]
 
 
+def _normalize_path(value: str) -> str:
+    normalized = value.strip().replace("\\", "/").casefold()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def _lexical_tokens(value: str) -> tuple[str, ...]:
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    return tuple(token.casefold() for token in LEXICAL_TOKEN.findall(camel_split))
+
+
+def _token_coverage(query_tokens: tuple[str, ...], value: str) -> float:
+    if not query_tokens:
+        return 0.0
+    value_tokens = set(_lexical_tokens(value))
+    return len(set(query_tokens) & value_tokens) / len(set(query_tokens))
+
+
+def _path_without_extension(value: str) -> str:
+    slash = value.rfind("/")
+    dot = value.rfind(".")
+    return value[:dot] if dot > slash else value
+
+
+def _matching_indexed_paths(query: str, indexed_paths: list[str]) -> list[str]:
+    normalized_query = _normalize_path(query)
+    if not normalized_query:
+        return []
+    query_has_path = "/" in normalized_query
+    matches: list[tuple[int, str]] = []
+    for relative_path in indexed_paths:
+        normalized_path = _normalize_path(relative_path)
+        filename = normalized_path.rsplit("/", 1)[-1]
+        extensionless = _path_without_extension(normalized_path)
+        if normalized_path == normalized_query:
+            priority = 0
+        elif filename == normalized_query:
+            priority = 1
+        elif query_has_path and (
+            normalized_path.endswith(f"/{normalized_query}")
+            or normalized_query.endswith(f"/{normalized_path}")
+            or extensionless.endswith(f"/{_path_without_extension(normalized_query)}")
+            or _path_without_extension(normalized_query).endswith(f"/{extensionless}")
+        ):
+            priority = 2
+        else:
+            continue
+        matches.append((priority, relative_path))
+    matches.sort(key=lambda item: (item[0], *_path_sort_key(Path(item[1]))))
+    return [path for _priority, path in matches[:MAX_HYBRID_PATH_MATCHES]]
+
+
+def _hybrid_score(query: str, result: CodeSearchResult) -> float:
+    normalized_query = query.strip().casefold()
+    query_path = _normalize_path(query)
+    query_tokens = _lexical_tokens(query)
+    symbol = result.symbol_name.casefold()
+    symbol_leaf = symbol.rsplit(".", 1)[-1]
+    path = _normalize_path(result.relative_path)
+    filename = path.rsplit("/", 1)[-1]
+    extensionless_path = _path_without_extension(path)
+    extensionless_query = _path_without_extension(query_path)
+
+    score = max(0.0, min(1.0, 1.0 - result.distance)) * 5.0
+    strong_symbol_match = False
+    if normalized_query == symbol:
+        score += 40.0
+        strong_symbol_match = True
+    elif normalized_query == symbol_leaf:
+        score += 38.0
+        strong_symbol_match = True
+    elif (
+        len(normalized_query) >= 3
+        and IDENTIFIER_QUERY.fullmatch(query.strip())
+        and symbol_leaf.startswith(normalized_query)
+    ):
+        score += 24.0
+        strong_symbol_match = True
+    score += _token_coverage(query_tokens, result.symbol_name) * 8.0
+
+    if query_path == path:
+        score += 36.0
+    elif query_path == filename:
+        score += 32.0
+    elif "/" in query_path and path.endswith(f"/{query_path}"):
+        score += 28.0
+    elif "/" in query_path and query_path.endswith(f"/{path}"):
+        score += 28.0
+    elif "/" in query_path and extensionless_path.endswith(f"/{extensionless_query}"):
+        score += 26.0
+    elif "/" in query_path and extensionless_query.endswith(f"/{extensionless_path}"):
+        score += 26.0
+    score += _token_coverage(query_tokens, result.relative_path) * 6.0
+    filename_stem = _path_without_extension(filename)
+    if filename_stem in set(query_tokens):
+        score += 4.0
+
+    score += _token_coverage(query_tokens, result.content) * 2.0
+    if len(query_tokens) == 1 and query_tokens[0] == result.language.casefold():
+        score += 1.0
+    if result.symbol_type in DEFINITION_SYMBOL_TYPES:
+        score += 4.0 if strong_symbol_match else 0.5
+    return score
+
+
+def _result_identity(result: CodeSearchResult) -> tuple[object, ...]:
+    return (
+        result.relative_path,
+        result.symbol_name,
+        result.symbol_type,
+        result.start_line,
+        result.end_line,
+        result.content,
+    )
+
+
+def _rerank_code_results(query: str, results: list[CodeSearchResult]) -> list[CodeSearchResult]:
+    unique = {_result_identity(result): result for result in results}
+    return sorted(
+        unique.values(),
+        key=lambda result: (
+            -_hybrid_score(query, result),
+            result.distance,
+            result.relative_path.casefold(),
+            result.relative_path,
+            result.start_line,
+            result.end_line,
+            result.symbol_name.casefold(),
+            result.symbol_name,
+            result.symbol_type,
+            hashlib.sha256(result.content.encode()).hexdigest(),
+        ),
+    )
+
+
 def index_codebase(store: CodeVectorStore | None = None) -> dict[str, int | bool]:
     root = _require_enabled()
     active_store = store or get_code_vector_store()
@@ -726,12 +874,22 @@ def search_codebase(
         raise CodeIndexError("Code search query is invalid")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SEARCH_LIMIT:
         raise CodeIndexError("Code search limit must be between 1 and 10")
+    active_store = store or get_code_vector_store()
+    workspace_id = workspace_identifier(root)
+    exact_symbol = query.strip() if IDENTIFIER_QUERY.fullmatch(query.strip()) else None
     try:
-        results = (store or get_code_vector_store()).search(
-            workspace_identifier(root), normalized, limit
+        indexed_paths = sorted(active_store.indexed_files(workspace_id))
+        matched_paths = _matching_indexed_paths(normalized, indexed_paths)
+        candidates = active_store._hybrid_candidates(
+            workspace_id,
+            normalized,
+            semantic_limit=HYBRID_VECTOR_CANDIDATES,
+            exact_symbol=exact_symbol,
+            relative_paths=matched_paths,
         )
     except VectorStoreError as exc:
         raise CodeIndexError("Codebase search failed") from exc
+    results = _rerank_code_results(normalized, candidates)[:limit]
     bounded: list[CodeSearchResult] = []
     remaining = MAX_SEARCH_TOTAL_CHARS
     for result in results[:limit]:
